@@ -1,89 +1,85 @@
-const { default: makeWASocket, useMultiFileAuthState, fetchLatestBaileysVersion } = require("@whiskeysockets/baileys");
+require("dotenv").config();
 const fs = require("fs");
+const { default: makeWASocket, fetchLatestBaileysVersion, useMultiFileAuthState, Browsers } = require("@whiskeysockets/baileys");
 const P = require("pino");
 const readline = require("readline");
-const dotenv = require("dotenv");
 
-dotenv.config();
-const logger = P({ level: "info" });
-const commands = {};
-const ownerNumber = "+94704467936@s.whatsapp.net"; // Owner number in WhatsApp JID format
+// Bot and owner info from .env
+const botNumber = process.env.BOT_NUMBER;
+const pairingPhone = process.env.PAIRING_PHONE;
+const imageUrl = process.env.IMAGE_URL;
 
-// Load commands from commands folder
+const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+const question = (text) => new Promise((resolve) => rl.question(text, resolve));
+
+const commands = new Map();
+
+// Dynamically load commands from 'commands' folder
 fs.readdirSync("./commands").forEach((file) => {
   if (file.endsWith(".js")) {
     const command = require(`./commands/${file}`);
-    commands[command.name] = command;
+    commands.set(command.use, command);
   }
 });
-
-// Setup readline for pairing code input
-const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-const question = (text) => new Promise((resolve) => rl.question(text, resolve));
 
 const startSock = async () => {
   const { state, saveCreds } = await useMultiFileAuthState("baileys_auth_info");
   const { version } = await fetchLatestBaileysVersion();
 
   const sock = makeWASocket({
-    version,
+    logger: P({ level: "info" }),
+    browser: Browsers.macOS("Firefox"),
     auth: state,
-    logger,
+    version,
   });
 
-  sock.ev.on("connection.update", async (update) => {
+  if (!sock.authState.creds.registered) {
+    console.log("Credentials not registered. Proceeding with pairing code...");
+    const code = await sock.requestPairingCode(pairingPhone);
+    console.log(`Pairing Code for ${pairingPhone}: ${code}`);
+  }
+
+  sock.ev.on("creds.update", saveCreds);
+
+  sock.ev.on("connection.update", (update) => {
     const { connection, lastDisconnect } = update;
     if (connection === "close") {
       const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== 401;
       console.log("Connection closed. Reconnecting:", shouldReconnect);
       if (shouldReconnect) startSock();
     } else if (connection === "open") {
-      console.log("Connected to WhatsApp!");
-
-      // Send a message to the bot's number and owner's number
-      const botNumber = sock.user.id.split(":")[0] + "@s.whatsapp.net";
+      console.log("WhatsApp Web connected successfully!");
       const message = {
-        image: { url: "./welcome.jpg" }, // Provide an image file in the project directory
-        caption: "🤖 *Bot Connected Successfully!*\n\nNow ready to accept commands.",
+        image: { url: imageUrl },
+        caption: "🤖 Bot connected successfully!\nReady to serve.",
       };
-
-      await sock.sendMessage(botNumber, message);
-      await sock.sendMessage(ownerNumber, message);
+      sock.sendMessage(botNumber + "@s.whatsapp.net", message);
     }
   });
 
-  // Handle pairing code if credentials are not registered
-  if (!sock.authState.creds.registered) {
-    const phoneNumber = await question("Enter your phone number (including country code): ");
-    const code = await sock.requestPairingCode(phoneNumber);
-    console.log(`Pairing Code: ${code}`);
-  }
+  sock.ev.on("messages.upsert", async (m) => {
+    const msg = m.messages[0];
+    if (!msg.message || msg.key.fromMe) return;
 
-  sock.ev.on("messages.upsert", async (msg) => {
-    const message = msg.messages[0];
-    if (!message.message || message.key.fromMe) return;
+    const text = msg.message.conversation || msg.message.extendedTextMessage?.text || "";
+    const command = commands.get(text.split(" ")[0]);
 
-    const text = message.message.conversation || message.message.extendedTextMessage?.text;
-    if (!text?.startsWith(".")) return; // Commands must start with '.'
-
-    const commandName = text.slice(1).split(" ")[0];
-    const command = commands[commandName];
     if (command) {
       try {
-        await command.execute(sock, message);
-        if (command.react) {
-          await sock.sendMessage(message.key.remoteJid, {
-            react: { text: command.react, key: message.key },
-          });
-        }
-      } catch (error) {
-        console.error("Error executing command:", error);
-        await sock.sendMessage(message.key.remoteJid, { text: "⚠️ *Error executing the command!*" });
+        await sock.sendMessage(msg.key.remoteJid, {
+          react: { text: command.react, key: msg.key },
+        });
+        await command.execute(sock, msg);
+      } catch (err) {
+        console.error(`Error executing command ${command.name}:`, err);
+        await sock.sendMessage(msg.key.remoteJid, {
+          text: `❌ Error executing command: ${err.message}`,
+        });
       }
     }
   });
 
-  sock.ev.on("creds.update", saveCreds);
+  return sock;
 };
 
 startSock();
